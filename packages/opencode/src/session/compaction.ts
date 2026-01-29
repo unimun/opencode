@@ -101,6 +101,7 @@ export namespace SessionCompaction {
     const model = agent.model
       ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
       : await Provider.getModel(userMessage.model.providerID, userMessage.model.modelID)
+    const needsSanitization = model.providerID.toLowerCase().includes("copilot")
     const msg = (await Session.updateMessage({
       id: Identifier.ascending("message"),
       role: "assistant",
@@ -141,6 +142,32 @@ export namespace SessionCompaction {
     const defaultPrompt =
       "Provide a detailed prompt for continuing our conversation above. Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next considering new session will not have access to our conversation."
     const promptText = compacting.prompt ?? [defaultPrompt, ...compacting.context].join("\n\n")
+    const sanitizeToolMessages = (msgs: any[]) => {
+      const isToolResultMessage = (msg: any) => msg.role === "tool"
+      const hasToolCalls = (msg: any) => msg.role === "assistant" && msg.tool_calls
+      const isEmptyContent = (msg: any) => typeof msg.content === "string" && msg.content === ""
+      const isToolPart = (part: any) => part.type === "tool-call" || part.type === "tool-result"
+      const isEmptyTextPart = (part: any) => part.type === "text" && part.text === ""
+
+      const hasValidContent = (msg: any) => {
+        if (msg.role !== "assistant" || !Array.isArray(msg.content)) return true
+        return msg.content.some((part: any) => !isToolPart(part) && !isEmptyTextPart(part))
+      }
+
+      const cleanAnthropicContent = (msg: any) => {
+        if (msg.role !== "assistant" || !Array.isArray(msg.content)) return msg
+        const filtered = msg.content.filter((part: any) => !isToolPart(part) && !isEmptyTextPart(part))
+        if (filtered.length === 0) return { ...msg, content: [{ type: "text", text: "" }] }
+        return { ...msg, content: filtered }
+      }
+
+      return msgs
+        .filter(
+          (msg) => !isToolResultMessage(msg) && !hasToolCalls(msg) && !isEmptyContent(msg) && hasValidContent(msg),
+        )
+        .map(cleanAnthropicContent)
+    }
+
     const result = await processor.process({
       user: userMessage,
       agent,
@@ -149,7 +176,9 @@ export namespace SessionCompaction {
       tools: {},
       system: [],
       messages: [
-        ...MessageV2.toModelMessages(input.messages, model),
+        ...(needsSanitization
+          ? sanitizeToolMessages(MessageV2.toModelMessages(input.messages, model))
+          : MessageV2.toModelMessages(input.messages, model)),
         {
           role: "user",
           content: [
